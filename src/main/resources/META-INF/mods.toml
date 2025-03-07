@@ -1,0 +1,31 @@
+modLoader="javafml" 
+loaderVersion="[40,41)" 
+license="MIT"
+
+[[mods]]
+modId="feathersweaponry" 
+version="1.0.0" 
+displayName="Feathers Weaponry" 
+authors="Sylsatra" 
+description='''This mod adds configurable feathers consumption based on weapon usage'''
+
+[[dependencies.forge]]
+modId="forge" 
+mandatory=true
+versionRange="[40,)" 
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.minecraft]]
+modId="minecraft" 
+mandatory=true
+versionRange="[1.18,1.19)" 
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.feathers]]
+modId="feathers"
+mandatory=true
+versionRange="[1.0.4]"
+ordering="NONE"
+side="BOTH"
