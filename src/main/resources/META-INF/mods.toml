@@ -1,31 +1,34 @@
-modLoader="javafml" 
-loaderVersion="[40,41)" 
-license="GPL-3.0-only"
+# This is an example mods.toml file. It contains the data relating to the loading mods.
+# There are several mandatory fields (#mandatory), and many more that are optional (#optional).
+# The overall format is standard TOML format, v0.5.0.
+# Note that there are a couple of TOML lists in this file.
+# Find more information on toml format here:  https://github.com/toml-lang/toml
 
-[[mods]]
-modId="feathersweaponry" 
-version="1.0.0" 
-displayName="Feathers Weaponry" 
-authors="Sylsatra" 
-description='''This mod adds configurable feathers consumption based on weapon usage'''
+modLoader="javafml" #mandatory
+loaderVersion="[43,)" #mandatory This is typically bumped every Minecraft version by Forge.
+license="GPLv3"
 
-[[dependencies.forge]]
-modId="forge" 
-mandatory=true
-versionRange="[40,)" 
-ordering="NONE"
-side="BOTH"
+[[mods]] #mandatory
+modId="feathersweaponry" #mandatory
+version="1.0.1" #mandatory
+displayName="Feathers Weaponry" #mandatory
+logoFile="examplemod.png" #optional
+credits="Thanks for this example mod goes to Java" #optional
+authors="Sylsatra" #optional
+description='''
+This mod adds configurable feathers consumption based on weapon usage
+'''
 
-[[dependencies.minecraft]]
-modId="minecraft" 
-mandatory=true
-versionRange="[1.18,1.19)" 
-ordering="NONE"
-side="BOTH"
+[[dependencies.examplemod]] #optional
+    modId="forge" #mandatory
+    mandatory=true #mandatory
+    versionRange="[43,)" #mandatory
+    ordering="NONE"
+    side="BOTH"
 
-[[dependencies.feathers]]
-modId="feathers"
-mandatory=true
-versionRange="[1.0.4]"
-ordering="NONE"
-side="BOTH"
+[[dependencies.examplemod]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.19, 1.20)"
+    ordering="NONE"
+    side="BOTH"
