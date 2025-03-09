@@ -18,6 +18,7 @@ import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.config.ModConfig;
+import net.minecraftforge.registries.ForgeRegistries;
 import com.elenai.feathers.api.FeathersHelper;
 
 @Mod("feathersweaponry")
@@ -53,21 +54,20 @@ public class FeathersWeaponry {
     }
 
     public static boolean isValidBow(ItemStack stack) {
-        ResourceLocation registryName = stack.getItem().getRegistryName();
+        ResourceLocation registryName = ForgeRegistries.ITEMS.getKey(stack.getItem());
         if (registryName == null) return false;
         String id = registryName.toString();
         return FeathersWeaponryConfig.validBowItems.get().contains(id);
     }
 
     public static boolean isValidWeapon(ItemStack stack) {
-        ResourceLocation registryName = stack.getItem().getRegistryName();
+        ResourceLocation registryName = ForgeRegistries.ITEMS.getKey(stack.getItem());
         if (registryName == null) return false;
         String id = registryName.toString();
         return FeathersWeaponryConfig.validWeaponItems.get().contains(id);
     }
 
     public static class EventHandlers {
-
 
         @SubscribeEvent
         public void onPlayerTick(TickEvent.PlayerTickEvent event) {
