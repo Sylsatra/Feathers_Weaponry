@@ -10,7 +10,6 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.effect.MobEffectInstance;
-import net.minecraft.world.effect.MobEffects;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.tags.TagKey;
@@ -19,8 +18,9 @@ import net.minecraft.world.item.ShieldItem;
 import net.minecraft.world.item.BowItem;
 import net.minecraft.world.item.CrossbowItem;
 import net.minecraft.world.item.TridentItem;
-import net.minecraft.world.Difficulty;
+import net.minecraft.world.item.ArmorItem;
 import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.Difficulty;
 import net.minecraft.world.entity.projectile.AbstractArrow;
 import net.minecraft.world.entity.projectile.ThrownTrident;
 import net.minecraft.world.phys.Vec3;
@@ -31,66 +31,329 @@ import net.minecraft.stats.StatType;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.living.LivingHurtEvent;
+import net.minecraftforge.event.entity.living.LivingEvent;
 import net.minecraftforge.event.entity.living.LivingAttackEvent;
 import net.minecraftforge.event.entity.living.ShieldBlockEvent;
 import net.minecraftforge.event.entity.player.PlayerInteractEvent;
 import net.minecraftforge.event.entity.player.AttackEntityEvent;
 import net.minecraftforge.event.entity.player.ArrowLooseEvent;
 import net.minecraftforge.event.entity.EntityJoinLevelEvent;
-import net.minecraftforge.event.level.BlockEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.eventbus.api.Event.Result;
 import net.minecraftforge.fml.ModLoadingContext;
+import net.minecraftforge.fml.DistExecutor;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.config.ModConfig;
+import net.minecraftforge.fml.event.config.ModConfigEvent;
+import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.api.distmarker.Dist;
+import java.lang.reflect.Field;
+import net.minecraft.server.level.ServerPlayerGameMode;
 import com.elenai.feathers.api.FeathersHelper;
 
 @Mod("feathersweaponry")
 public class FeathersWeaponry {
 
-    private static final Map<UUID, DrawData> activeDraws = new HashMap<>();
+    private static final Map<UUID, DrawData> activeDraws = new java.util.concurrent.ConcurrentHashMap<>();
     private static final Random random = new Random();
 
     private static class Rule {
         final boolean isTag;
         final ResourceLocation id;
-        final double factor;
+        final ConfiguredItemRule costs;
         final TagKey<Item> tagKey;
 
-        Rule(boolean isTag, ResourceLocation id, double factor) {
+        Rule(boolean isTag, ResourceLocation id, ConfiguredItemRule costs) {
             this.isTag = isTag;
             this.id = id;
-            this.factor = factor;
+            this.costs = costs;
             this.tagKey = isTag ? ItemTags.create(id) : null;
         }
     }
 
-    private static Map<ResourceLocation, Double> bowExactFactors = null;
-    private static java.util.List<Rule> bowTagRules = null;
-    private static Map<ResourceLocation, Double> weaponExactFactors = null;
-    private static java.util.List<Rule> weaponTagRules = null;
+    private static class RulesSnapshot {
+        final Map<ResourceLocation, ConfiguredItemRule> bowExactFactors;
+        final java.util.List<Rule> bowTagRules;
+        final Map<ResourceLocation, ConfiguredItemRule> weaponExactFactors;
+        final java.util.List<Rule> weaponTagRules;
+
+        RulesSnapshot(
+                Map<ResourceLocation, ConfiguredItemRule> bowExactFactors,
+                java.util.List<Rule> bowTagRules,
+                Map<ResourceLocation, ConfiguredItemRule> weaponExactFactors,
+                java.util.List<Rule> weaponTagRules) {
+            this.bowExactFactors = bowExactFactors;
+            this.bowTagRules = bowTagRules;
+            this.weaponExactFactors = weaponExactFactors;
+            this.weaponTagRules = weaponTagRules;
+        }
+    }
+
+    private static volatile RulesSnapshot cachedRules = null;
+    private static final Object RULES_LOCK = new Object();
 
     public FeathersWeaponry() {
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, FeathersWeaponryConfig.CONFIG);
+        FMLJavaModLoadingContext.get().getModEventBus().addListener(FeathersWeaponry::onConfigEvent);
+        FeathersWeaponryNetwork.register();
+        DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> BetterCombatCompat::registerClient);
+        DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> ClientMovementEvents::register);
         MinecraftForge.EVENT_BUS.register(new EventHandlers());
     }
 
-    public static void subtractFeathers(Player player, int amount) {
-        if (player instanceof ServerPlayer) {
-            FeathersHelper.subFeathers((ServerPlayer) player, amount);
+    public static void onConfigEvent(ModConfigEvent event) {
+        if (event != null && event.getConfig() != null && event.getConfig().getSpec() == FeathersWeaponryConfig.CONFIG) {
+            cachedRules = null;
         }
     }
 
-    public static void subtractFeathersDouble(Player player, double amount) {
-        if (player instanceof ServerPlayer) {
-            PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
-            data.featherAccumulator += amount;
-            if (data.featherAccumulator >= 1.0) {
-                int toSubtract = (int) data.featherAccumulator;
-                FeathersHelper.subFeathers((ServerPlayer) player, toSubtract);
-                data.featherAccumulator -= toSubtract;
+    private static RulesSnapshot getRules() {
+        RulesSnapshot snapshot = cachedRules;
+        if (snapshot == null) {
+            synchronized (RULES_LOCK) {
+                snapshot = cachedRules;
+                if (snapshot == null) {
+                    var listsBow = FeathersWeaponryConfig.validBowItems.get();
+                    var parsedBow = parseRules(listsBow, false);
+                    var listsWeapon = FeathersWeaponryConfig.validWeaponItems.get();
+                    var parsedWeapon = parseRules(listsWeapon, true);
+                    snapshot = new RulesSnapshot(parsedBow.exact, parsedBow.tags, parsedWeapon.exact, parsedWeapon.tags);
+                    cachedRules = snapshot;
+                }
             }
         }
+        return snapshot;
+    }
+
+    public static boolean subtractFeathers(Player player, int amount) {
+        if (!(player instanceof ServerPlayer serverPlayer) || amount <= 0) {
+            return true;
+        }
+
+        boolean spent = spendFeathersForAction(serverPlayer, amount);
+        if (spent) {
+            PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+            blockRegenAfterCost(serverPlayer, data);
+        }
+        return spent;
+    }
+
+    public static boolean subtractFeathersDouble(Player player, double amount) {
+        if (!(player instanceof ServerPlayer serverPlayer) || amount <= 0.0) {
+            return true;
+        }
+
+        PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+        if (Double.isNaN(data.featherAccumulator) || Double.isInfinite(data.featherAccumulator) || data.featherAccumulator < 0.0) {
+            data.featherAccumulator = 0.0;
+        }
+
+        FeatherBudgetRules.FractionalSpend spend = FeatherBudgetRules.accumulateVisibleCost(data.featherAccumulator, amount);
+        if (spend.halfFeatherCost() == 0) {
+            data.featherAccumulator = spend.remainingVisibleCost();
+            return true;
+        }
+
+        boolean spent = spendFeathersForAction(serverPlayer, spend.halfFeatherCost());
+        if (spent) {
+            data.featherAccumulator = spend.remainingVisibleCost();
+            blockRegenAfterCost(serverPlayer, data);
+        } else {
+            data.featherAccumulator = 0.0;
+        }
+        return spent;
+    }
+
+    private static boolean canSpendFeathers(ServerPlayer player, int amount) {
+        if (amount <= 0 || player.isCreative() || player.isSpectator()) {
+            return true;
+        }
+        return FeatherBudgetRules.canAfford(
+                FeathersHelper.getFeathers(player),
+                FeathersHelper.getEndurance(player),
+                getEffectiveWeight(player),
+                amount);
+    }
+
+    private static boolean spendFeathersForAction(ServerPlayer player, int amount) {
+        if (amount <= 0 || player.isCreative() || player.isSpectator()) {
+            return true;
+        }
+        if (!canSpendFeathers(player, amount)) {
+            return false;
+        }
+        return FeathersHelper.spendFeathers(player, amount);
+    }
+
+    private static boolean canStartAction(ServerPlayer player, double minimumFeathers, double cost) {
+        int halfFeatherCost = FeatherBudgetRules.toHalfFeatherUnits(cost);
+        return FeatherBudgetRules.canStartAction(
+                FeathersHelper.getFeathers(player),
+                FeathersHelper.getEndurance(player),
+                getEffectiveWeight(player),
+                minimumFeathers,
+                halfFeatherCost);
+    }
+
+    private static boolean isExhausted(ServerPlayer player, double minimumFeathers) {
+        return FeatherBudgetRules.isExhausted(
+                FeathersHelper.getFeathers(player),
+                FeathersHelper.getEndurance(player),
+                getEffectiveWeight(player),
+                minimumFeathers);
+    }
+
+    private static int getEffectiveWeight(ServerPlayer player) {
+        if (player == null) {
+            return 0;
+        }
+        int weight = 0;
+        for (ItemStack stack : player.getArmorSlots()) {
+            if (stack != null && !stack.isEmpty() && stack.getItem() instanceof ArmorItem) {
+                weight += FeathersHelper.getArmorWeightByStack(stack);
+            }
+        }
+        return weight;
+    }
+
+    private static void blockRegenAfterCost(ServerPlayer player, PlayerDataTracker.PlayerData data) {
+        if (player == null || player.level() == null || data == null) {
+            return;
+        }
+        int delay = FeathersWeaponryConfig.regenDelayAfterCostTicks.get();
+        if (delay <= 0) {
+            data.regenHoldFeathers = -1;
+            data.regenBlockedUntilTick = 0;
+            return;
+        }
+        long gameTime = player.level().getGameTime();
+        data.regenBlockedUntilTick = gameTime + delay;
+        int currentFeathers = FeathersHelper.getFeathers(player);
+        data.regenHoldFeathers = currentFeathers;
+    }
+
+    private static void suppressRegenIfBlocked(ServerPlayer player, PlayerDataTracker.PlayerData data) {
+        if (player == null || player.level() == null || data == null || data.regenHoldFeathers < 0) {
+            return;
+        }
+
+        long currentTick = player.level().getGameTime();
+        int delay = FeathersWeaponryConfig.regenDelayAfterCostTicks.get();
+        if (currentTick < 0 || currentTick > data.regenBlockedUntilTick || data.regenBlockedUntilTick - currentTick > delay + 200) {
+            data.regenHoldFeathers = -1;
+            data.regenBlockedUntilTick = 0;
+            return;
+        }
+
+        int currentFeathers = FeathersHelper.getFeathers(player);
+        if (currentFeathers > data.regenHoldFeathers) {
+            FeathersHelper.setFeathers(player, data.regenHoldFeathers);
+        } else if (currentFeathers < data.regenHoldFeathers) {
+            data.regenHoldFeathers = currentFeathers;
+        }
+    }
+
+    private static volatile Field destroyingBlockField = null;
+    private static volatile boolean destroyingBlockFieldResolved = false;
+    private static final Object DESTROYING_BLOCK_LOCK = new Object();
+
+    private static boolean isDestroyingBlock(ServerPlayer player) {
+        if (player == null || player.gameMode == null) {
+            return false;
+        }
+        if (!destroyingBlockFieldResolved) {
+            synchronized (DESTROYING_BLOCK_LOCK) {
+                if (!destroyingBlockFieldResolved) {
+                    try {
+                        destroyingBlockField = ServerPlayerGameMode.class.getDeclaredField("isDestroyingBlock");
+                        destroyingBlockField.setAccessible(true);
+                    } catch (NoSuchFieldException e) {
+                        try {
+                            destroyingBlockField = ServerPlayerGameMode.class.getDeclaredField("f_9249_");
+                            destroyingBlockField.setAccessible(true);
+                        } catch (NoSuchFieldException ignored) {
+                        }
+                    }
+                    destroyingBlockFieldResolved = true;
+                }
+            }
+        }
+        if (destroyingBlockField != null) {
+            try {
+                return destroyingBlockField.getBoolean(player.gameMode);
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
+    private static void handleSwingDeduction(ServerPlayer player, PlayerDataTracker.PlayerData data, ItemStack stack) {
+        if (!FeathersWeaponryConfig.meleeSwingEnabled.get()) return;
+        if (player == null || player.level() == null || data == null || stack == null || stack.isEmpty()) return;
+        if (isDestroyingBlock(player)) return;
+        
+        long currentTick = player.level().getGameTime();
+        if (currentTick <= data.lastBlockInteractionTick + 2) return;
+        chargePendingSwingMiss(player, data, currentTick);
+        if (currentTick <= data.lastSwingTick + 5) return;
+        data.lastSwingTick = currentTick;
+
+        ConfiguredItemRule rule = resolveWeaponRule(stack);
+        if (rule == null) return;
+        double learningMultiplier = getMovementLearningMultiplier(player, "walking");
+        double swingCost = rule.secondaryCost() * learningMultiplier;
+        
+        data.pendingSwingCost = swingCost;
+        data.pendingSwingMinimum = rule.minimumFeathers();
+        data.pendingSwingTick = currentTick;
+    }
+
+    static void handleBetterCombatSwing(ServerPlayer player, boolean offHand, long sequence) {
+        if (player == null || player.level() == null) return;
+        PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+        long currentTick = player.level().getGameTime();
+        if (data.lastBetterCombatSwingSequence == sequence && currentTick <= data.lastBetterCombatSwingTick + 20) {
+            return;
+        }
+
+        data.lastBetterCombatSwingSequence = sequence;
+        data.lastBetterCombatSwingTick = currentTick;
+
+        ItemStack stack = offHand ? player.getOffhandItem() : player.getMainHandItem();
+        if (isValidWeapon(stack)) {
+            handleSwingDeduction(player, data, stack);
+            data.pendingSwingSequence = sequence;
+        }
+    }
+
+    private static void chargePendingSwingMiss(ServerPlayer player, PlayerDataTracker.PlayerData data, long currentTick) {
+        if (player == null || data == null || data.pendingSwingCost <= 0.0 || isDestroyingBlock(player)) {
+            return;
+        }
+        int delayTicks = FeathersWeaponryConfig.meleeSwingMissChargeDelayTicks.get();
+        if (!SwingChargeRules.shouldChargeMiss(currentTick, data.pendingSwingTick, delayTicks)) {
+            return;
+        }
+
+        double swingCost = data.pendingSwingCost;
+        double minimum = data.pendingSwingMinimum;
+        data.pendingSwingCost = 0.0;
+        data.pendingSwingMinimum = 0.0;
+        data.pendingSwingTick = 0;
+        data.pendingSwingSequence = Long.MIN_VALUE;
+
+        boolean spent = subtractFeathersDouble(player, swingCost);
+        if (!spent || isExhausted(player, minimum)) {
+            applySwingPunishments(player, minimum);
+        }
+    }
+
+    private static void applySwingPunishments(ServerPlayer player, double minimum) {
+        if (!FeathersWeaponryConfig.meleeSwingTriggersPunishment.get()) {
+            return;
+        }
+        applyRotatorCuffTears(player, minimum);
+        applyPenaltyIfLowFeathers(player, minimum);
     }
 
     public static int getFeathers(Player player) {
@@ -101,62 +364,52 @@ public class FeathersWeaponry {
     }
 
     public static boolean isHardOrHardcore(Player player) {
-        Difficulty difficulty = player.level().getDifficulty();
-        return difficulty == Difficulty.HARD || difficulty == Difficulty.HARD;
+        if (player == null || player.level() == null) {
+            return false;
+        }
+        return player.level().getDifficulty() == Difficulty.HARD || player.level().getLevelData().isHardcore();
     }
 
-    /**
-     * Calculate learning curve multiplier based on player statistics
-     * Returns a value between minMultiplier and 1.0
-     * Formula: multiplier = max(minMultiplier, 1.0 - (statValue / maxStat) * learningRate * (1.0 - minMultiplier))
-     */
     public static double getLearningMultiplier(ServerPlayer player, Stat<?> stat) {
         if (!FeathersWeaponryConfig.learningCurveEnabled.get()) return 1.0;
+        if (player == null || stat == null || player.getStats() == null) return 1.0;
         
         int statValue = player.getStats().getValue(stat);
         int maxStat = FeathersWeaponryConfig.learningCurveMaxStat.get();
         double minMultiplier = FeathersWeaponryConfig.learningCurveMinMultiplier.get();
         double learningRate = FeathersWeaponryConfig.learningCurveRate.get();
         
-
         double progress = Math.min(1.0, (double) statValue / maxStat * learningRate);
-        
-
         double multiplier = 1.0 - (progress * (1.0 - minMultiplier));
-        
         return Math.max(minMultiplier, multiplier);
     }
 
-    /**
-     * Get learning multiplier for item usage (right-click)
-     */
     public static double getItemUseLearningMultiplier(ServerPlayer player, ItemStack stack) {
         if (!FeathersWeaponryConfig.learningCurveEnabled.get()) return 1.0;
+        if (player == null || stack == null || stack.isEmpty()) return 1.0;
         
         Item item = stack.getItem();
+        if (item == null) return 1.0;
         Stat<Item> stat = Stats.ITEM_USED.get(item);
+        if (stat == null) return 1.0;
         return getLearningMultiplier(player, stat);
     }
 
-    /**
-     * Get learning multiplier for weapon usage (left-click/attack)
-     */
     public static double getWeaponLearningMultiplier(ServerPlayer player, ItemStack stack) {
         if (!FeathersWeaponryConfig.learningCurveEnabled.get()) return 1.0;
+        if (player == null) return 1.0;
         
-
-        return getLearningMultiplier(player, Stats.CUSTOM.get(Stats.MOB_KILLS));
+        Stat<?> stat = Stats.CUSTOM.get(Stats.MOB_KILLS);
+        if (stat == null) return 1.0;
+        return getLearningMultiplier(player, stat);
     }
 
-    /**
-     * Calculate flying maneuverability multiplier based on direction/angle changes
-     * Returns 1.0 for straight flight, up to maneuverabilityMultiplier for complex maneuvers
-     */
     public static double calculateFlyingManeuverability(ServerPlayer player, PlayerDataTracker.PlayerData data) {
-
+        if (player == null || data == null) {
+            return 1.0;
+        }
         double currentYaw = player.getYRot();
         double currentPitch = player.getXRot();
-        
 
         if (data.isFirstFlyTick) {
             data.lastFlyYaw = currentYaw;
@@ -164,45 +417,34 @@ public class FeathersWeaponry {
             data.isFirstFlyTick = false;
             return 1.0;
         }
-        
 
         double yawChange = Math.abs(normalizeAngle(currentYaw - data.lastFlyYaw));
         double pitchChange = Math.abs(currentPitch - data.lastFlyPitch);
-        
 
         double totalChange = Math.toRadians(yawChange + pitchChange);
-        
 
         data.lastFlyYaw = currentYaw;
         data.lastFlyPitch = currentPitch;
-        
 
         double threshold = FeathersWeaponryConfig.flyingManeuverabilityThreshold.get();
         if (totalChange > threshold) {
-
             double multiplier = FeathersWeaponryConfig.flyingManeuverabilityMultiplier.get();
-
             double scaleFactor = Math.min(1.0, (totalChange - threshold) / threshold);
             return 1.0 + (scaleFactor * (multiplier - 1.0));
         }
-        
+
         return 1.0;
     }
     
-    /**
-     * Normalize angle to -180 to 180 range
-     */
     private static double normalizeAngle(double angle) {
         while (angle > 180) angle -= 360;
         while (angle < -180) angle += 360;
         return angle;
     }
 
-    /**
-     * Get learning multiplier for movement activities
-     */
     public static double getMovementLearningMultiplier(ServerPlayer player, String activity) {
         if (!FeathersWeaponryConfig.learningCurveEnabled.get()) return 1.0;
+        if (player == null) return 1.0;
         
         Stat<?> stat;
         switch (activity) {
@@ -224,35 +466,40 @@ public class FeathersWeaponry {
             default:
                 return 1.0;
         }
-        
+        if (stat == null) return 1.0;
         return getLearningMultiplier(player, stat);
     }
 
     public static void applyPenaltyIfLowFeathers(Player player) {
-        if (!(player instanceof ServerPlayer)) return;
-        int currentFeathers = FeathersHelper.getFeathers((ServerPlayer) player);
-        if (currentFeathers <= 1) {
-            int amplifier = (player.getAirSupply() < FeathersWeaponryConfig.bubbleThreshold.get()) ? 1 : 0;
-            int duration = 60; 
-            player.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, duration, amplifier));
-            player.addEffect(new MobEffectInstance(MobEffects.DIG_SLOWDOWN, duration, amplifier));
+        applyPenaltyIfLowFeathers(player, 1.0);
+    }
+
+    public static void applyPenaltyIfLowFeathers(Player player, double threshold) {
+        if (!(player instanceof ServerPlayer serverPlayer) || serverPlayer.level() == null) return;
+        if (isExhausted(serverPlayer, threshold)) {
+            PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+            long currentTime = player.level().getGameTime();
+            if (currentTime - data.lastLowFeatherPenaltyTime < 40) {
+                return;
+            }
+            data.lastLowFeatherPenaltyTime = currentTime;
+            applyConfiguredEffects(player, FeathersWeaponryConfig.lowFeatherPenaltyEffects.get());
         }
     }
 
-
     public static void applyRotatorCuffTears(Player player) {
+        applyRotatorCuffTears(player, 2.0);
+    }
+
+    public static void applyRotatorCuffTears(Player player, double threshold) {
         if (!FeathersWeaponryConfig.rotatorCuffEnabled.get()) return;
         if (FeathersWeaponryConfig.rotatorCuffHardModeOnly.get() && !isHardOrHardcore(player)) return;
-        
-        int currentFeathers = getFeathers(player);
-        if (currentFeathers >= 2) return;
-        
+        if (!(player instanceof ServerPlayer serverPlayer) || serverPlayer.level() == null || !isExhausted(serverPlayer, threshold)) return;
 
         PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
         long currentTime = player.level().getGameTime();
         if (currentTime - data.lastRotatorCuffTime < 100) return;
         data.lastRotatorCuffTime = currentTime;
-        
 
         double roll = random.nextDouble();
         double damage;
@@ -260,44 +507,49 @@ public class FeathersWeaponry {
         double maxDmg = FeathersWeaponryConfig.rotatorCuffMaxDamage.get();
         
         if (roll < 0.7) {
-
             damage = minDmg + (random.nextDouble() * Math.min(2.0, (maxDmg - minDmg) / 3.0));
         } else if (roll < 0.9) {
-
             damage = Math.min(maxDmg, 2.0) + (random.nextDouble() * Math.min(2.0, (maxDmg - 2.0)));
         } else {
-
             damage = Math.min(maxDmg, 4.0) + (random.nextDouble() * (maxDmg - 4.0));
         }
         
         damage = Math.max(minDmg, Math.min(maxDmg, damage));
-        
 
-        player.hurt(player.damageSources().generic(), (float) damage);
-        
-
-        int fatigueLevel = 0;
-        int fatigueDuration = 30;
-        
-        if (damage <= 2.0) {
-            fatigueLevel = 0;
-            fatigueDuration = 30;
-        } else if (damage <= 4.0) {
-            fatigueLevel = 1;
-            fatigueDuration = 60;
-        } else {
-            fatigueLevel = 2;
-            fatigueDuration = 90;
+        if (damage > 0.0) {
+            DamageSource source = FeatherDamageSources.exhaustion(serverPlayer.serverLevel());
+            if (source != null) {
+                player.hurt(source, (float) damage);
+            }
         }
-        
-        player.addEffect(new MobEffectInstance(MobEffects.DIG_SLOWDOWN, fatigueDuration, fatigueLevel));
+
+        PunishmentRules.Severity severity = PunishmentRules.severityForDamage(damage);
+        switch (severity) {
+            case MINOR -> applyConfiguredEffects(player, FeathersWeaponryConfig.rotatorCuffMinorEffects.get());
+            case MODERATE -> applyConfiguredEffects(player, FeathersWeaponryConfig.rotatorCuffModerateEffects.get());
+            case SEVERE -> applyConfiguredEffects(player, FeathersWeaponryConfig.rotatorCuffSevereEffects.get());
+        }
     }
 
+    private static void applyConfiguredEffects(Player player, java.util.List<? extends String> entries) {
+        if (player == null || entries == null) return;
+        for (PunishmentRules.EffectRule rule : PunishmentRules.parseEffects(entries)) {
+            ResourceLocation id = ResourceLocation.tryParse(rule.effectId());
+            if (id == null) {
+                continue;
+            }
+
+            var effect = BuiltInRegistries.MOB_EFFECT.get(id);
+            if (effect != null) {
+                player.addEffect(new MobEffectInstance(effect, rule.durationTicks(), rule.amplifier()));
+            }
+        }
+    }
 
     public static void applySwimmerShoulder(Player player) {
         if (!FeathersWeaponryConfig.activityPunishmentsEnabled.get()) return;
         if (FeathersWeaponryConfig.activityPunishmentsHardModeOnly.get() && !isHardOrHardcore(player)) return;
-        
+        if (!(player instanceof ServerPlayer serverPlayer) || serverPlayer.level() == null) return;
 
         PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
         long currentTime = player.level().getGameTime();
@@ -308,16 +560,19 @@ public class FeathersWeaponry {
         double maxDmg = FeathersWeaponryConfig.swimmerShoulderMaxDamage.get();
         double damage = minDmg + (random.nextDouble() * (maxDmg - minDmg));
         
-        player.hurt(player.damageSources().generic(), (float) damage);
-        player.addEffect(new MobEffectInstance(MobEffects.DIG_SLOWDOWN, 300, 1));
-        player.addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SLOWDOWN, 200, 0));
-        player.addEffect(new MobEffectInstance(MobEffects.HUNGER, 300, 1));
+        if (damage > 0.0) {
+            DamageSource source = FeatherDamageSources.exhaustion(serverPlayer.serverLevel());
+            if (source != null) {
+                player.hurt(source, (float) damage);
+            }
+        }
+        applyConfiguredEffects(player, FeathersWeaponryConfig.swimmerShoulderEffects.get());
     }
 
     public static void applyRunnerFatigue(Player player) {
         if (!FeathersWeaponryConfig.activityPunishmentsEnabled.get()) return;
         if (FeathersWeaponryConfig.activityPunishmentsHardModeOnly.get() && !isHardOrHardcore(player)) return;
-        
+        if (!(player instanceof ServerPlayer serverPlayer) || serverPlayer.level() == null) return;
 
         PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
         long currentTime = player.level().getGameTime();
@@ -328,16 +583,19 @@ public class FeathersWeaponry {
         double maxDmg = FeathersWeaponryConfig.runnerFatigueMaxDamage.get();
         double damage = minDmg + (random.nextDouble() * (maxDmg - minDmg));
         
-        player.hurt(player.damageSources().generic(), (float) damage);
-        player.addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SLOWDOWN, 400, 1));
-        player.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, 200, 0));
-        player.addEffect(new MobEffectInstance(MobEffects.HUNGER, 300, 0));
+        if (damage > 0.0) {
+            DamageSource source = FeatherDamageSources.exhaustion(serverPlayer.serverLevel());
+            if (source != null) {
+                player.hurt(source, (float) damage);
+            }
+        }
+        applyConfiguredEffects(player, FeathersWeaponryConfig.runnerFatigueEffects.get());
     }
 
     public static void applyPilotStrain(Player player) {
         if (!FeathersWeaponryConfig.activityPunishmentsEnabled.get()) return;
         if (FeathersWeaponryConfig.activityPunishmentsHardModeOnly.get() && !isHardOrHardcore(player)) return;
-        
+        if (!(player instanceof ServerPlayer serverPlayer) || serverPlayer.level() == null) return;
 
         PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
         long currentTime = player.level().getGameTime();
@@ -348,15 +606,19 @@ public class FeathersWeaponry {
         double maxDmg = FeathersWeaponryConfig.pilotStrainMaxDamage.get();
         double damage = minDmg + (random.nextDouble() * (maxDmg - minDmg));
         
-        player.hurt(player.damageSources().generic(), (float) damage);
-        player.addEffect(new MobEffectInstance(MobEffects.LEVITATION, 60, -1));
-        player.addEffect(new MobEffectInstance(MobEffects.CONFUSION, 140, 0));
+        if (damage > 0.0) {
+            DamageSource source = FeatherDamageSources.exhaustion(serverPlayer.serverLevel());
+            if (source != null) {
+                player.hurt(source, (float) damage);
+            }
+        }
+        applyConfiguredEffects(player, FeathersWeaponryConfig.pilotStrainEffects.get());
     }
 
     public static void applyWalkerCramp(Player player) {
         if (!FeathersWeaponryConfig.activityPunishmentsEnabled.get()) return;
         if (FeathersWeaponryConfig.activityPunishmentsHardModeOnly.get() && !isHardOrHardcore(player)) return;
-        
+        if (!(player instanceof ServerPlayer serverPlayer) || serverPlayer.level() == null) return;
 
         PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
         long currentTime = player.level().getGameTime();
@@ -365,9 +627,13 @@ public class FeathersWeaponry {
         
         double damage = FeathersWeaponryConfig.walkerCrampDamage.get();
         
-        player.hurt(player.damageSources().generic(), (float) damage);
-        player.addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SLOWDOWN, 300, 0));
-        player.addEffect(new MobEffectInstance(MobEffects.HUNGER, 150, 0));
+        if (damage > 0.0) {
+            DamageSource source = FeatherDamageSources.exhaustion(serverPlayer.serverLevel());
+            if (source != null) {
+                player.hurt(source, (float) damage);
+            }
+        }
+        applyConfiguredEffects(player, FeathersWeaponryConfig.walkerCrampEffects.get());
     }
 
     private static class DrawData {
@@ -375,33 +641,18 @@ public class FeathersWeaponry {
         int secondsDrawn = 0;
     }
 
-    private static void ensureRulesBuilt() {
-        if (bowExactFactors == null || bowTagRules == null) {
-            var lists = FeathersWeaponryConfig.validBowItems.get();
-            var parsed = parseRules(lists);
-            bowExactFactors = parsed.exact;
-            bowTagRules = parsed.tags;
-        }
-        if (weaponExactFactors == null || weaponTagRules == null) {
-            var lists = FeathersWeaponryConfig.validWeaponItems.get();
-            var parsed = parseRules(lists);
-            weaponExactFactors = parsed.exact;
-            weaponTagRules = parsed.tags;
-        }
-    }
-
     private static class ParsedRules {
-        final Map<ResourceLocation, Double> exact;
+        final Map<ResourceLocation, ConfiguredItemRule> exact;
         final java.util.List<Rule> tags;
 
-        ParsedRules(Map<ResourceLocation, Double> exact, java.util.List<Rule> tags) {
+        ParsedRules(Map<ResourceLocation, ConfiguredItemRule> exact, java.util.List<Rule> tags) {
             this.exact = exact;
             this.tags = tags;
         }
     }
 
-    private static ParsedRules parseRules(java.util.List<? extends String> entries) {
-        Map<ResourceLocation, Double> exact = new HashMap<>();
+    private static ParsedRules parseRules(java.util.List<? extends String> entries, boolean weapon) {
+        Map<ResourceLocation, ConfiguredItemRule> exact = new HashMap<>();
         java.util.List<Rule> tags = new java.util.ArrayList<>();
         if (entries != null) {
             for (String raw : entries) {
@@ -409,96 +660,192 @@ public class FeathersWeaponry {
                 String s = raw.trim();
                 boolean isTag = s.startsWith("#");
                 if (isTag) s = s.substring(1);
-                double factor = 1.0;
                 int eq = s.indexOf('=');
                 String idStr = s;
+                String value = "1.0";
                 if (eq >= 0) {
                     idStr = s.substring(0, eq).trim();
-                    String fStr = s.substring(eq + 1).trim();
-                    try {
-                        factor = Double.parseDouble(fStr);
-                    } catch (NumberFormatException ignored) {
-                        factor = 1.0;
-                    }
+                    value = s.substring(eq + 1).trim();
                 }
                 ResourceLocation id = ResourceLocation.tryParse(idStr);
                 if (id == null) continue;
+                ConfiguredItemRule costs = weapon
+                        ? ConfiguredItemRule.parseWeaponValue(
+                                value,
+                                FeathersWeaponryConfig.meleeSwingMultiplier.get(),
+                                FeathersWeaponryConfig.leftClickMinFeathers.get())
+                        : ConfiguredItemRule.parseBowValue(value, FeathersWeaponryConfig.rightClickMinFeathers.get());
                 if (isTag) {
-                    tags.add(new Rule(true, id, factor));
+                    tags.add(new Rule(true, id, costs));
                 } else {
-                    exact.put(id, factor);
+                    exact.put(id, costs);
                 }
             }
         }
         return new ParsedRules(exact, tags);
     }
 
-    private static double resolveBowFactor(ItemStack stack) {
-        ensureRulesBuilt();
-        ResourceLocation registryName = BuiltInRegistries.ITEM.getKey(stack.getItem());
-        if (registryName == null) return Double.NaN;
-        Double exact = bowExactFactors.get(registryName);
+    private static ConfiguredItemRule resolveBowRule(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return null;
+        Item item = stack.getItem();
+        if (item == null) return null;
+        ResourceLocation registryName = BuiltInRegistries.ITEM.getKey(item);
+        if (registryName == null) return null;
+        RulesSnapshot rules = getRules();
+        ConfiguredItemRule exact = rules.bowExactFactors.get(registryName);
         if (exact != null) return exact;
-        for (Rule r : bowTagRules) {
-            if (stack.is(r.tagKey)) return r.factor;
+        for (Rule r : rules.bowTagRules) {
+            if (r.tagKey != null && stack.is(r.tagKey)) return r.costs;
         }
-        return Double.NaN;
+        return null;
     }
 
-    private static double resolveWeaponFactor(ItemStack stack) {
-        ensureRulesBuilt();
-        ResourceLocation registryName = BuiltInRegistries.ITEM.getKey(stack.getItem());
-        if (registryName == null) return Double.NaN;
-        Double exact = weaponExactFactors.get(registryName);
+    private static ConfiguredItemRule resolveWeaponRule(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return null;
+        Item item = stack.getItem();
+        if (item == null) return null;
+        ResourceLocation registryName = BuiltInRegistries.ITEM.getKey(item);
+        if (registryName == null) return null;
+        RulesSnapshot rules = getRules();
+        ConfiguredItemRule exact = rules.weaponExactFactors.get(registryName);
         if (exact != null) return exact;
-        for (Rule r : weaponTagRules) {
-            if (stack.is(r.tagKey)) return r.factor;
+        for (Rule r : rules.weaponTagRules) {
+            if (r.tagKey != null && stack.is(r.tagKey)) return r.costs;
         }
-        return Double.NaN;
+        return null;
+    }
+
+    public static boolean isClientRestrictedWeapon(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        return resolveWeaponRule(stack) != null;
+    }
+
+    public static boolean isClientRestrictedUse(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        return isValidBow(stack) || stack.getItem() instanceof ShieldItem;
+    }
+
+    public static boolean allowsClientProjectileFallback(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        ConfiguredItemRule rule = resolveBowRule(stack);
+        return rule != null && !rule.cancelAtMinimum() && FeathersWeaponryConfig.velocityReductionEnabled.get();
     }
 
     public static boolean isValidBow(ItemStack stack) {
-        return !Double.isNaN(resolveBowFactor(stack));
+        if (stack == null || stack.isEmpty()) return false;
+        return resolveBowRule(stack) != null;
     }
 
     public static boolean isValidWeapon(ItemStack stack) {
-        return !Double.isNaN(resolveWeaponFactor(stack));
+        if (stack == null || stack.isEmpty()) return false;
+        return resolveWeaponRule(stack) != null;
+    }
+
+    public static double clientWeaponMinimum(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return FeathersWeaponryConfig.leftClickMinFeathers.get();
+        ConfiguredItemRule rule = resolveWeaponRule(stack);
+        return rule == null ? FeathersWeaponryConfig.leftClickMinFeathers.get() : rule.minimumFeathers();
+    }
+
+    public static int clientWeaponStartCost(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return 0;
+        ConfiguredItemRule rule = resolveWeaponRule(stack);
+        return rule == null ? 0 : FeatherBudgetRules.toHalfFeatherUnits(rule.primaryCost() + rule.secondaryCost());
+    }
+
+    public static int clientUseStartCost(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return 0;
+        ConfiguredItemRule rule = resolveBowRule(stack);
+        if (rule != null) {
+            return FeatherBudgetRules.toHalfFeatherUnits(rule.primaryCost());
+        }
+        return stack.getItem() instanceof ShieldItem
+                ? FeatherBudgetRules.toHalfFeatherUnits(FeathersWeaponryConfig.rightClickMinFeathers.get())
+                : 0;
+    }
+
+    public static double clientUseMinimum(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return FeathersWeaponryConfig.rightClickMinFeathers.get();
+        ConfiguredItemRule rule = resolveBowRule(stack);
+        return rule == null ? FeathersWeaponryConfig.rightClickMinFeathers.get() : rule.minimumFeathers();
     }
 
     public static class EventHandlers {
-
         @SubscribeEvent
         public void onPlayerTick(TickEvent.PlayerTickEvent event) {
+            if (event.phase != TickEvent.Phase.END) return;
             Player player = event.player;
+            if (player == null || player.level() == null) return;
             if (player.level().isClientSide) return;
-            if (!(player instanceof ServerPlayer)) return;
+            if (!(player instanceof ServerPlayer serverPlayer)) return;
             
-            ServerPlayer serverPlayer = (ServerPlayer) player;
             UUID playerId = player.getUUID();
             PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(playerId);
-            
+
+            suppressRegenIfBlocked(serverPlayer, data);
 
             handleDrawing(player, playerId);
-            
 
             handleShieldCosts(serverPlayer, data);
-            
 
             handleMovementCosts(serverPlayer, data);
+
+            if (isDestroyingBlock(serverPlayer)) {
+                data.lastBlockInteractionTick = serverPlayer.level().getGameTime();
+                data.pendingSwingCost = 0.0;
+                data.pendingSwingMinimum = 0.0;
+                data.pendingSwingTick = 0;
+                data.pendingSwingSequence = Long.MIN_VALUE;
+            } else {
+                chargePendingSwingMiss(serverPlayer, data, serverPlayer.level().getGameTime());
+
+                if (serverPlayer.swinging && serverPlayer.swingTime == 1) { 
+                    ItemStack mainHand = serverPlayer.getMainHandItem();
+                    if (isValidWeapon(mainHand)) {
+                        handleSwingDeduction(serverPlayer, data, mainHand);
+                    }
+                }
+            }
+        }
+
+        @SubscribeEvent
+        public void onLivingJump(LivingEvent.LivingJumpEvent event) {
+            if (event == null || !(event.getEntity() instanceof ServerPlayer player)) return;
+            if (player.level() == null) return;
+            
+            if (!FeathersWeaponryConfig.movementCostsEnabled.get()) return;
+
+            double jumpCost = FeathersWeaponryConfig.jumpingCost.get();
+            double learningMultiplier = getMovementLearningMultiplier(player, "jumping");
+            jumpCost *= learningMultiplier;
+
+            if (!MovementCostRules.canStartActivity(
+                        getFeathers(player),
+                        FeathersHelper.getEndurance(player),
+                        getEffectiveWeight(player),
+                        FeathersWeaponryConfig.jumpingMinFeathers.get())
+                    || !subtractFeathersDouble(player, jumpCost)) {
+                Vec3 motion = player.getDeltaMovement();
+                if (motion != null) {
+                    player.setDeltaMovement(motion.x, 0.0, motion.z);
+                }
+                player.hurtMarked = true;
+                applyPenaltyIfLowFeathers(player, FeathersWeaponryConfig.jumpingMinFeathers.get());
+            }
         }
 
         private void handleDrawing(Player player, UUID playerId) {
+            if (player == null || playerId == null) return;
             if (player.isUsingItem()) {
                 ItemStack itemStack = player.getUseItem();
-                if (itemStack != null && isValidBow(itemStack)) {
+                if (itemStack != null && !itemStack.isEmpty() && isValidBow(itemStack)) {
                     DrawData data = activeDraws.getOrDefault(playerId, new DrawData());
                     data.tickCount++;
                     if (data.tickCount >= FeathersWeaponryConfig.drawTimeThreshold.get()) {
                         data.secondsDrawn++;
                         int base = data.secondsDrawn;
-                        double factor = resolveBowFactor(itemStack);
-                        if (Double.isNaN(factor)) factor = 1.0;
-                        double cost = base * factor;
+                        ConfiguredItemRule bowRule = resolveBowRule(itemStack);
+                        double cost = base * (bowRule == null ? 1.0 : bowRule.primaryCost());
                         if (player.getAirSupply() < FeathersWeaponryConfig.bubbleThreshold.get()) {
                             cost *= 2.0;
                         }
@@ -509,16 +856,29 @@ public class FeathersWeaponry {
                             cost *= learningMultiplier;
                         }
                         
-                        int deduction = Math.max(1, (int) Math.ceil(cost));
-                        subtractFeathers(player, deduction);
-                        
-
-                        int currentFeathers = getFeathers(player);
-                        if (currentFeathers < 2) {
-                            applyRotatorCuffTears(player);
+                        int deduction = FeatherBudgetRules.toHalfFeatherUnits(cost);
+                        if (!subtractFeathers(player, deduction)) {
+                            if (bowRule == null || bowRule.cancelAtMinimum()) {
+                                player.stopUsingItem();
+                            }
+                            double minimum = bowRule == null
+                                    ? FeathersWeaponryConfig.rightClickMinFeathers.get()
+                                    : bowRule.minimumFeathers();
+                            applyPenaltyIfLowFeathers(player, minimum);
+                            data.tickCount = 0;
+                            activeDraws.put(playerId, data);
+                            return;
                         }
                         
-                        applyPenaltyIfLowFeathers(player);
+
+                        double minimum = bowRule == null
+                                ? FeathersWeaponryConfig.rightClickMinFeathers.get()
+                                : bowRule.minimumFeathers();
+                        if (player instanceof ServerPlayer serverPlayer && isExhausted(serverPlayer, minimum)) {
+                            applyRotatorCuffTears(player, minimum);
+                        }
+                        
+                        applyPenaltyIfLowFeathers(player, minimum);
                         data.tickCount = 0;
                     }
                     activeDraws.put(playerId, data);
@@ -531,9 +891,10 @@ public class FeathersWeaponry {
         }
 
         private void handleShieldCosts(ServerPlayer player, PlayerDataTracker.PlayerData data) {
+            if (player == null || player.level() == null || data == null) return;
             ItemStack useItem = player.getUseItem();
             
-            if (useItem.getItem() instanceof ShieldItem && player.isBlocking()) {
+            if (useItem != null && !useItem.isEmpty() && useItem.getItem() instanceof ShieldItem && player.isBlocking()) {
                 long currentTick = player.level().getGameTime();
                 
 
@@ -547,7 +908,10 @@ public class FeathersWeaponry {
 
                     if (data.shieldRaisedTicks >= 40) {
                         double cost = FeathersWeaponryConfig.shieldOvertimeCost.get();
-                        subtractFeathersDouble(player, cost);
+                        if (!subtractFeathersDouble(player, cost)) {
+                            player.stopUsingItem();
+                            applyPenaltyIfLowFeathers(player, FeathersWeaponryConfig.rightClickMinFeathers.get());
+                        }
                         data.shieldRaisedTicks = 0;
                     }
                 }
@@ -558,8 +922,11 @@ public class FeathersWeaponry {
                     
                     if (data.lastShieldDurability > 0 && currentDurability < data.lastShieldDurability) {
                         int durabilityLost = data.lastShieldDurability - currentDurability;
-                        double cost = Math.ceil(durabilityLost * FeathersWeaponryConfig.shieldDamageFactor.get());
-                        subtractFeathersDouble(player, cost);
+                        double cost = durabilityLost * FeathersWeaponryConfig.shieldDamageFactor.get();
+                        if (!subtractFeathersDouble(player, cost)) {
+                            player.stopUsingItem();
+                            applyPenaltyIfLowFeathers(player, FeathersWeaponryConfig.rightClickMinFeathers.get());
+                        }
                     }
                     
                     data.lastShieldDurability = currentDurability;
@@ -573,24 +940,26 @@ public class FeathersWeaponry {
         }
 
         private void handleMovementCosts(ServerPlayer player, PlayerDataTracker.PlayerData data) {
+            if (player == null || player.level() == null || data == null) return;
             if (!FeathersWeaponryConfig.movementCostsEnabled.get()) return;
             
             long currentTick = player.level().getGameTime();
+            if (data.lastMovementTick == 0) {
+                data.lastPosX = player.getX();
+                data.lastPosY = player.getY();
+                data.lastPosZ = player.getZ();
+                data.lastMovementTick = currentTick;
+                return;
+            }
+            if (data.sprintExhaustedCooldownUntil < 0 || data.sprintExhaustedCooldownUntil > currentTick + 1200) {
+                data.sprintExhaustedCooldownUntil = 0;
+            }
             double costPerTick = 0.0;
             String currentActivity = "";
             
 
-            boolean isOnGround = player.onGround();
-            if (!isOnGround && data.wasOnGround) {
-
-                double jumpCost = FeathersWeaponryConfig.runningCostPerSecond.get() / 20.0;
-
-                double learningMultiplier = getMovementLearningMultiplier(player, "jumping");
-                jumpCost *= learningMultiplier;
-                subtractFeathersDouble(player, jumpCost * 5);
-            }
-            data.wasOnGround = isOnGround;
-            
+            boolean isActivelyGliding = GlidersCompat.isActivelyGliding(player);
+            boolean isFlying = player.isFallFlying() || isActivelyGliding;
 
             if (player.isSwimming()) {
                 costPerTick = FeathersWeaponryConfig.swimmingCostPerSecond.get() / 20.0;
@@ -599,15 +968,10 @@ public class FeathersWeaponry {
                 data.consecutiveRunTicks = 0;
                 data.consecutiveFlyTicks = 0;
                 data.consecutiveWalkTicks = 0;
-            } else if (player.isSprinting()) {
-                costPerTick = FeathersWeaponryConfig.runningCostPerSecond.get() / 20.0;
-                currentActivity = "running";
-                data.consecutiveRunTicks++;
-                data.consecutiveSwimTicks = 0;
-                data.consecutiveFlyTicks = 0;
-                data.consecutiveWalkTicks = 0;
-            } else if (player.isFallFlying()) {
-                costPerTick = FeathersWeaponryConfig.flyingCostPerSecond.get() / 20.0;
+            } else if (isFlying) {
+                costPerTick = (isActivelyGliding && !player.isFallFlying()
+                        ? FeathersWeaponryConfig.gliderCostPerSecond.get()
+                        : FeathersWeaponryConfig.flyingCostPerSecond.get()) / 20.0;
                 
 
                 if (FeathersWeaponryConfig.flyingManeuverabilityEnabled.get()) {
@@ -619,6 +983,13 @@ public class FeathersWeaponry {
                 data.consecutiveFlyTicks++;
                 data.consecutiveSwimTicks = 0;
                 data.consecutiveRunTicks = 0;
+                data.consecutiveWalkTicks = 0;
+            } else if (player.isSprinting()) {
+                costPerTick = FeathersWeaponryConfig.runningCostPerSecond.get() / 20.0;
+                currentActivity = "running";
+                data.consecutiveRunTicks++;
+                data.consecutiveSwimTicks = 0;
+                data.consecutiveFlyTicks = 0;
                 data.consecutiveWalkTicks = 0;
             } else if (!player.isCrouching() && isMoving(player, data)) {
                 costPerTick = FeathersWeaponryConfig.walkingCostPerSecond.get() / 20.0;
@@ -637,28 +1008,35 @@ public class FeathersWeaponry {
             }
             
 
-            if (costPerTick > 0) {
+            if (!currentActivity.isEmpty()) {
 
                 double learningMultiplier = getMovementLearningMultiplier(player, currentActivity);
-                double adjustedCost = costPerTick * learningMultiplier;
-                subtractFeathersDouble(player, adjustedCost);
-                
-
-                int currentFeathers = getFeathers(player);
-                if (currentFeathers < 2) {
-
-                    if (currentActivity.equals("swimming") && data.consecutiveSwimTicks > 100) {
-                        applySwimmerShoulder(player);
-                        data.consecutiveSwimTicks = 0;
-                    } else if (currentActivity.equals("running") && data.consecutiveRunTicks > 100) {
-                        applyRunnerFatigue(player);
-                        data.consecutiveRunTicks = 0;
-                    } else if (currentActivity.equals("flying") && data.consecutiveFlyTicks > 100) {
-                        applyPilotStrain(player);
-                        data.consecutiveFlyTicks = 0;
-                    } else if (currentActivity.equals("walking") && data.consecutiveWalkTicks > 200) {
-                        applyWalkerCramp(player);
-                        data.consecutiveWalkTicks = 0;
+                double adjustedCost = MovementCostRules.adjustedCost(costPerTick, learningMultiplier, isActivelyGliding);
+                double minimumFeathers = movementMinimumFor(currentActivity, isActivelyGliding);
+                boolean allowed = MovementCostRules.canStartActivity(
+                                currentActivity,
+                                getFeathers(player),
+                                FeathersHelper.getEndurance(player),
+                                getEffectiveWeight(player),
+                                minimumFeathers,
+                                currentTick,
+                                data.sprintExhaustedCooldownUntil)
+                        && subtractFeathersDouble(player, adjustedCost);
+                if (!allowed) {
+                    restrictMovement(player, currentActivity);
+                    applyPenaltyIfLowFeathers(player, minimumFeathers);
+                    applyMovementPunishment(player, currentActivity);
+                    resetMovementCounter(data, currentActivity);
+                    if ("running".equals(currentActivity) || "swimming".equals(currentActivity)) {
+                        long cooldownTicks = ClientAttackGate.calculateCooldownTicks(FeathersWeaponryConfig.sprintExhaustionCooldownSeconds.get());
+                        data.sprintExhaustedCooldownUntil = Math.max(data.sprintExhaustedCooldownUntil, currentTick + cooldownTicks);
+                    }
+                } else if (isExhausted(player, minimumFeathers)) {
+                    applyPenaltyIfLowFeathers(player, minimumFeathers);
+                    applyMovementPunishment(player, currentActivity);
+                    if ("running".equals(currentActivity) || "swimming".equals(currentActivity)) {
+                        long cooldownTicks = ClientAttackGate.calculateCooldownTicks(FeathersWeaponryConfig.sprintExhaustionCooldownSeconds.get());
+                        data.sprintExhaustedCooldownUntil = Math.max(data.sprintExhaustedCooldownUntil, currentTick + cooldownTicks);
                     }
                 }
             }
@@ -671,6 +1049,7 @@ public class FeathersWeaponry {
         }
 
         private boolean isMoving(ServerPlayer player, PlayerDataTracker.PlayerData data) {
+            if (player == null || data == null) return false;
             double dx = player.getX() - data.lastPosX;
             double dy = player.getY() - data.lastPosY;
             double dz = player.getZ() - data.lastPosZ;
@@ -678,16 +1057,81 @@ public class FeathersWeaponry {
             return distSq > 0.001;
         }
 
+        private double movementMinimumFor(String activity, boolean activeGlider) {
+            return switch (activity) {
+                case "swimming" -> FeathersWeaponryConfig.swimmingMinFeathers.get();
+                case "running" -> FeathersWeaponryConfig.runningMinFeathers.get();
+                case "flying" -> activeGlider
+                        ? FeathersWeaponryConfig.gliderMinFeathers.get()
+                        : FeathersWeaponryConfig.flyingMinFeathers.get();
+                case "walking" -> FeathersWeaponryConfig.walkingMinFeathers.get();
+                default -> 0.0;
+            };
+        }
+
+        private void restrictMovement(ServerPlayer player, String activity) {
+            if (player == null) return;
+            boolean wasSprinting = player.isSprinting();
+            boolean wasSwimming = player.isSwimming();
+            boolean wasFallFlying = player.isFallFlying();
+
+            if ("running".equals(activity)) {
+                player.setSprinting(false);
+            }
+            if ("swimming".equals(activity)) {
+                player.setSwimming(false);
+                player.setSprinting(false);
+            }
+            if ("flying".equals(activity) && wasFallFlying) {
+                player.stopFallFlying();
+            }
+            if ("flying".equals(activity)) {
+                GlidersCompat.forceStopGliding(player);
+            }
+
+            Vec3 motion = player.getDeltaMovement();
+            if (motion != null) {
+                double y = MovementCostRules.restrictedVerticalVelocity(activity, motion.y);
+                player.setDeltaMovement(motion.x * 0.2, y, motion.z * 0.2);
+
+                if (wasSprinting || wasSwimming || wasFallFlying || (motion.x * motion.x + motion.z * motion.z) > 0.01) {
+                    player.hurtMarked = true;
+                }
+            }
+        }
+
+        private void resetMovementCounter(PlayerDataTracker.PlayerData data, String activity) {
+            if (data == null) return;
+            if ("swimming".equals(activity)) {
+                data.consecutiveSwimTicks = 0;
+            } else if ("running".equals(activity)) {
+                data.consecutiveRunTicks = 0;
+            } else if ("flying".equals(activity)) {
+                data.consecutiveFlyTicks = 0;
+            } else if ("walking".equals(activity)) {
+                data.consecutiveWalkTicks = 0;
+            }
+        }
+
+        private void applyMovementPunishment(ServerPlayer player, String activity) {
+            switch (activity) {
+                case "swimming" -> applySwimmerShoulder(player);
+                case "running" -> applyRunnerFatigue(player);
+                case "flying" -> applyPilotStrain(player);
+                case "walking" -> applyWalkerCramp(player);
+                default -> {
+                }
+            }
+        }
+
         @SubscribeEvent
         public void onLivingHurt(LivingHurtEvent event) {
-            if (!(event.getSource().getEntity() instanceof ServerPlayer)) return;
-            ServerPlayer player = (ServerPlayer) event.getSource().getEntity();
+            if (event == null || event.getSource() == null || !(event.getSource().getEntity() instanceof ServerPlayer player)) return;
+            if (player.level() == null) return;
             ItemStack mainHand = player.getMainHandItem();
-            if (mainHand != null && isValidWeapon(mainHand)) {
-                int base = 1;
-                double factor = resolveWeaponFactor(mainHand);
-                if (Double.isNaN(factor)) factor = 1.0;
-                double cost = base * factor;
+            if (mainHand != null && !mainHand.isEmpty() && isValidWeapon(mainHand)) {
+                ConfiguredItemRule weaponRule = resolveWeaponRule(mainHand);
+                double cost = weaponRule == null ? 1.0 : weaponRule.primaryCost();
                 if (player.getAirSupply() < FeathersWeaponryConfig.bubbleThreshold.get()) {
                     cost *= 2.0;
                 }
@@ -696,34 +1140,45 @@ public class FeathersWeaponry {
                 double learningMultiplier = getWeaponLearningMultiplier(player, mainHand);
                 cost *= learningMultiplier;
                 
-                int deduction = Math.max(1, (int) Math.ceil(cost));
-                subtractFeathers(player, deduction);
-                
+                PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+                SwingChargeRules.HitCharge charge = SwingChargeRules.resolveHitCharge(cost, data.pendingSwingCost);
+                data.pendingSwingCost = 0.0;
+                data.pendingSwingMinimum = 0.0;
+                data.pendingSwingTick = 0;
+                data.pendingSwingSequence = Long.MIN_VALUE;
 
-                int currentFeathers = getFeathers(player);
-                if (currentFeathers < 2) {
-                    applyRotatorCuffTears(player);
+                if (!subtractFeathers(player, charge.wholeCost())) {
+                    event.setCanceled(true);
+                    double minimum = weaponRule == null
+                            ? FeathersWeaponryConfig.leftClickMinFeathers.get()
+                            : weaponRule.minimumFeathers();
+                    applySwingPunishments(player, minimum);
+                    return;
                 }
-                
-                applyPenaltyIfLowFeathers(player);
+
+                double minimum = weaponRule == null
+                        ? FeathersWeaponryConfig.leftClickMinFeathers.get()
+                        : weaponRule.minimumFeathers();
+                if (isExhausted(player, minimum)) {
+                    applySwingPunishments(player, minimum);
+                }
             }
         }
 
         @SubscribeEvent
         public void onRightClickItem(PlayerInteractEvent.RightClickItem event) {
-            if (!(event.getEntity() instanceof Player)) return;
-            Player player = (Player) event.getEntity();
-            if (player.level().isClientSide) return;
-            if (!(player instanceof ServerPlayer)) return;
+            if (event == null || event.getEntity() == null) return;
+            Player player = event.getEntity();
+            if (player.level() == null || player.level().isClientSide) return;
+            if (!(player instanceof ServerPlayer serverPlayer)) return;
             
-            ServerPlayer serverPlayer = (ServerPlayer) player;
             ItemStack stack = event.getItemStack();
+            if (stack == null || stack.isEmpty()) return;
             
 
             if (stack.isEdible()) return;
             
-            int feathers = FeathersHelper.getFeathers(serverPlayer);
-            int minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
+            double minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
             
 
             double itemCost = 0;
@@ -731,8 +1186,9 @@ public class FeathersWeaponry {
             boolean isRangedWeapon = false;
             
             if (isValidBow(stack)) {
-                itemCost = resolveBowFactor(stack);
-                if (Double.isNaN(itemCost)) itemCost = 1.0;
+                ConfiguredItemRule bowRule = resolveBowRule(stack);
+                itemCost = bowRule != null ? bowRule.primaryCost() : 1.0;
+                minRequired = bowRule != null ? bowRule.minimumFeathers() : minRequired;
                 isRestrictedItem = true;
                 isRangedWeapon = (stack.getItem() instanceof BowItem || 
                                  stack.getItem() instanceof CrossbowItem || 
@@ -742,40 +1198,23 @@ public class FeathersWeaponry {
                 isRestrictedItem = true;
                 itemCost = minRequired;
             }
-            
 
-            if (isRestrictedItem && (feathers < minRequired || (itemCost > 0 && feathers < itemCost))) {
+            if (isRestrictedItem) {
+                boolean allowed = canStartAction(serverPlayer, minRequired, itemCost);
+                if (!allowed) {
 
-                if (FeathersWeaponryConfig.velocityReductionEnabled.get() && isRangedWeapon) {
+                    ConfiguredItemRule bowRule = resolveBowRule(stack);
+                    boolean projectileFallback = bowRule != null
+                            && !bowRule.cancelAtMinimum()
+                            && FeathersWeaponryConfig.velocityReductionEnabled.get();
+                    if (projectileFallback && isRangedWeapon) {
+                        if (stack.getItem() instanceof CrossbowItem && CrossbowItem.isCharged(stack)) {
+                            markCrossbowInaccuracy(serverPlayer);
+                        }
 
-                    return;
-                }
-                
-                if (FeathersWeaponryConfig.cancelAnimations.get()) {
-                    event.setCanceled(true);
-                }
-            }
-        }
+                        return;
+                    }
 
-        @SubscribeEvent
-        public void onRightClickBlock(PlayerInteractEvent.RightClickBlock event) {
-            if (!(event.getEntity() instanceof Player)) return;
-            Player player = (Player) event.getEntity();
-            if (player.level().isClientSide) return;
-            if (!(player instanceof ServerPlayer)) return;
-            
-            ServerPlayer serverPlayer = (ServerPlayer) player;
-            ItemStack stack = event.getItemStack();
-            
-
-            if (stack.isEdible()) return;
-            
-            int feathers = FeathersHelper.getFeathers(serverPlayer);
-            int minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
-            
-
-            if (stack.getItem() instanceof net.minecraft.world.item.BlockItem) {
-                if (feathers < minRequired) {
                     if (FeathersWeaponryConfig.cancelAnimations.get()) {
                         event.setCanceled(true);
                     }
@@ -784,117 +1223,181 @@ public class FeathersWeaponry {
         }
 
         @SubscribeEvent
-        public void onLeftClickEmpty(PlayerInteractEvent.LeftClickEmpty event) {
-
-        }
-
-        @SubscribeEvent
-        public void onAttackEntity(AttackEntityEvent event) {
-            if (!(event.getEntity() instanceof ServerPlayer)) return;
-            ServerPlayer player = (ServerPlayer) event.getEntity();
+        public void onRightClickBlock(PlayerInteractEvent.RightClickBlock event) {
+            if (event == null || event.getEntity() == null) return;
+            Player player = event.getEntity();
+            if (player.level() == null || player.level().isClientSide) return;
+            if (!(player instanceof ServerPlayer serverPlayer)) return;
             
-            ItemStack mainHand = player.getMainHandItem();
-            int feathers = FeathersHelper.getFeathers(player);
-            double minRequired = FeathersWeaponryConfig.leftClickMinFeathers.get();
+            ItemStack stack = event.getItemStack();
+            if (stack == null || stack.isEmpty()) return;
             
 
-            double itemCost = 0;
-            if (isValidWeapon(mainHand)) {
-                itemCost = resolveWeaponFactor(mainHand);
-                if (Double.isNaN(itemCost)) itemCost = 1.0;
-            }
+            if (stack.isEdible()) return;
+            
+            int minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
             
 
-            if (feathers < minRequired || (itemCost > 0 && feathers < itemCost)) {
-                if (FeathersWeaponryConfig.cancelAnimations.get()) {
-                    event.setCanceled(true);
+            if (stack.getItem() instanceof net.minecraft.world.item.BlockItem) {
+                if (!canStartAction(serverPlayer, minRequired, 0.0)) {
+                    if (FeathersWeaponryConfig.cancelAnimations.get()) {
+                        event.setCanceled(true);
+                    }
                 }
             }
         }
 
+        private void markCrossbowInaccuracy(ServerPlayer player) {
+            if (player == null || player.level() == null) return;
+            if (!FeathersWeaponryConfig.lowFeatherInaccuracyEnabled.get()) {
+                return;
+            }
+
+            double degrees = FeathersWeaponryConfig.lowFeatherInaccuracyDegrees.get();
+            if (degrees <= 0.0) {
+                return;
+            }
+
+            PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+            data.crossbowInaccuracyUntilTick = player.level().getGameTime() + 5;
+            data.crossbowInaccuracyDegrees = degrees;
+        }
+
         @SubscribeEvent
-        public void onBlockBreak(BlockEvent.BreakEvent event) {
-            if (!(event.getPlayer() instanceof ServerPlayer)) return;
-            ServerPlayer player = (ServerPlayer) event.getPlayer();
+        public void onAttackEntity(AttackEntityEvent event) {
+            if (event == null || !(event.getEntity() instanceof ServerPlayer player)) return;
+            if (player.level() == null) return;
             
             ItemStack mainHand = player.getMainHandItem();
-            int feathers = FeathersHelper.getFeathers(player);
-            double minRequired = FeathersWeaponryConfig.leftClickMinFeathers.get();
-            
-
-            double itemCost = 0;
-            if (isValidWeapon(mainHand)) {
-                itemCost = resolveWeaponFactor(mainHand);
-                if (Double.isNaN(itemCost)) itemCost = 0.5;
+            if (mainHand == null || mainHand.isEmpty()) return;
+            ConfiguredItemRule weaponRule = resolveWeaponRule(mainHand);
+            if (weaponRule == null) {
+                return;
             }
-            
 
-            if (feathers < minRequired || (itemCost > 0 && feathers < itemCost)) {
+            double minRequired = weaponRule.minimumFeathers();
+            double learningMultiplier = getWeaponLearningMultiplier(player, mainHand);
+            double hitCost = weaponRule.primaryCost() * learningMultiplier;
+            if (player.getAirSupply() < FeathersWeaponryConfig.bubbleThreshold.get()) {
+                hitCost *= 2.0;
+            }
+            double combinedCost = hitCost + weaponRule.secondaryCost() * learningMultiplier;
+            int startCost = FeatherBudgetRules.toHalfFeatherUnits(combinedCost);
+
+            PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+            boolean canceled = AttackStartRules.shouldCancelAttackStart(
+                    true,
+                    FeathersHelper.getFeathers(player),
+                    FeathersHelper.getEndurance(player),
+                    getEffectiveWeight(player),
+                    minRequired,
+                    startCost,
+                    FeathersWeaponryConfig.cancelAnimations.get());
+            if (canceled) {
                 event.setCanceled(true);
+                data.pendingSwingCost = 0.0;
+                data.pendingSwingMinimum = 0.0;
+                data.pendingSwingTick = 0;
+                data.pendingSwingSequence = Long.MIN_VALUE;
+                applySwingPunishments(player, minRequired);
+            } else {
+                handleSwingDeduction(player, data, mainHand);
             }
         }
 
         @SubscribeEvent
+        public void onLeftClickBlock(PlayerInteractEvent.LeftClickBlock event) {
+            if (event == null || !(event.getEntity() instanceof ServerPlayer player)) return;
+            if (player.level() == null) return;
+            PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+            data.lastBlockInteractionTick = player.level().getGameTime();
+            data.pendingSwingCost = 0.0;
+            data.pendingSwingMinimum = 0.0;
+            data.pendingSwingTick = 0;
+            data.pendingSwingSequence = Long.MIN_VALUE;
+        }
+
+        @SubscribeEvent
+        public void onBlockBreak(net.minecraftforge.event.level.BlockEvent.BreakEvent event) {
+            if (event == null || !(event.getPlayer() instanceof ServerPlayer player)) return;
+            if (player.level() == null) return;
+            PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+            data.lastBlockInteractionTick = player.level().getGameTime();
+            data.pendingSwingCost = 0.0;
+            data.pendingSwingMinimum = 0.0;
+            data.pendingSwingTick = 0;
+            data.pendingSwingSequence = Long.MIN_VALUE;
+        }
+
+        @SubscribeEvent
         public void onShieldBlock(ShieldBlockEvent event) {
-            if (!(event.getEntity() instanceof ServerPlayer)) return;
-            ServerPlayer player = (ServerPlayer) event.getEntity();
+            if (event == null || !(event.getEntity() instanceof ServerPlayer player)) return;
+            if (player.level() == null) return;
             
-            int feathers = FeathersHelper.getFeathers(player);
             int minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
             
 
-            if (feathers < minRequired) {
+            if (!canStartAction(player, minRequired, minRequired)) {
                 event.setCanceled(true);
 
                 player.stopUsingItem();
+                applyPenaltyIfLowFeathers(player, minRequired);
             }
         }
 
         @SubscribeEvent
         public void onEntityJoinLevel(EntityJoinLevelEvent event) {
             if (!FeathersWeaponryConfig.velocityReductionEnabled.get()) return;
+            if (event == null || event.getLevel() == null || event.getEntity() == null) return;
             if (event.getLevel().isClientSide()) return;
             
 
-            if (event.getEntity() instanceof AbstractArrow) {
-                AbstractArrow arrow = (AbstractArrow) event.getEntity();
-                
-                if (arrow.getOwner() instanceof ServerPlayer) {
-                    ServerPlayer player = (ServerPlayer) arrow.getOwner();
-                    int feathers = FeathersHelper.getFeathers(player);
+            if (event.getEntity() instanceof AbstractArrow arrow) {
+                if (arrow.getOwner() instanceof ServerPlayer player) {
+                    if (player.level() == null) return;
                     int minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
                     
+                    PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(player.getUUID());
+                    long currentTick = player.level().getGameTime();
+                    if (currentTick <= data.crossbowInaccuracyUntilTick && data.crossbowInaccuracyDegrees > 0.0) {
+                        double degrees = data.crossbowInaccuracyDegrees;
+                        double yawOffset = (random.nextDouble() * 2.0 - 1.0) * degrees;
+                        double pitchOffset = (random.nextDouble() * 2.0 - 1.0) * degrees;
+                        arrow.setDeltaMovement(CrossbowProjectileSpread.rotate(arrow.getDeltaMovement(), yawOffset, pitchOffset));
+                        return;
+                    }
 
-                    if (feathers < minRequired) {
+                    if (!canStartAction(player, minRequired, 0.0)) {
 
                         Vec3 motion = arrow.getDeltaMovement();
-                        double multiplier = FeathersWeaponryConfig.lowFeatherVelocityMultiplier.get();
-                        arrow.setDeltaMovement(motion.scale(multiplier));
-                        
+                        if (motion != null) {
+                            double multiplier = FeathersWeaponryConfig.lowFeatherVelocityMultiplier.get();
+                            arrow.setDeltaMovement(motion.scale(multiplier));
+                            
 
-                        arrow.setBaseDamage(arrow.getBaseDamage() * multiplier);
+                            arrow.setBaseDamage(arrow.getBaseDamage() * multiplier);
+                        }
                     }
                 }
             }
             
 
-            if (event.getEntity() instanceof ThrownTrident) {
-                ThrownTrident trident = (ThrownTrident) event.getEntity();
-                
-                if (trident.getOwner() instanceof ServerPlayer) {
-                    ServerPlayer player = (ServerPlayer) trident.getOwner();
-                    int feathers = FeathersHelper.getFeathers(player);
+            if (event.getEntity() instanceof ThrownTrident trident) {
+                if (trident.getOwner() instanceof ServerPlayer player) {
+                    if (player.level() == null) return;
                     int minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
                     
 
-                    if (feathers < minRequired) {
+                    if (!canStartAction(player, minRequired, 0.0)) {
 
                         Vec3 motion = trident.getDeltaMovement();
-                        double multiplier = FeathersWeaponryConfig.lowFeatherVelocityMultiplier.get();
-                        trident.setDeltaMovement(motion.scale(multiplier));
-                        
+                        if (motion != null) {
+                            double multiplier = FeathersWeaponryConfig.lowFeatherVelocityMultiplier.get();
+                            trident.setDeltaMovement(motion.scale(multiplier));
+                            
 
-                        trident.setBaseDamage(trident.getBaseDamage() * multiplier);
+                            trident.setBaseDamage(trident.getBaseDamage() * multiplier);
+                        }
                     }
                 }
             }
@@ -902,21 +1405,28 @@ public class FeathersWeaponry {
 
         @SubscribeEvent
         public void onPlayerTick_CrossbowCheck(TickEvent.PlayerTickEvent event) {
+            if (event.phase != TickEvent.Phase.END) return;
             if (!FeathersWeaponryConfig.velocityReductionEnabled.get()) return;
             if (!FeathersWeaponryConfig.crossbowResetOnFail.get()) return;
+            if (event.player == null || event.player.level() == null) return;
             if (event.player.level().isClientSide) return;
-            if (!(event.player instanceof ServerPlayer)) return;
+            if (!(event.player instanceof ServerPlayer player)) return;
             
-            ServerPlayer player = (ServerPlayer) event.player;
             ItemStack useItem = player.getUseItem();
+            if (useItem == null || useItem.isEmpty()) return;
             
 
             if (useItem.getItem() instanceof CrossbowItem && player.isUsingItem()) {
-                int feathers = FeathersHelper.getFeathers(player);
-                int minRequired = FeathersWeaponryConfig.rightClickMinFeathers.get();
+                ConfiguredItemRule bowRule = resolveBowRule(useItem);
+                double minRequired = bowRule == null
+                        ? FeathersWeaponryConfig.rightClickMinFeathers.get()
+                        : bowRule.minimumFeathers();
                 
 
-                if (!CrossbowItem.isCharged(useItem) && feathers < minRequired) {
+                if (!CrossbowItem.isCharged(useItem)
+                        && bowRule != null
+                        && bowRule.cancelAtMinimum()
+                        && !canStartAction(player, minRequired, bowRule.primaryCost())) {
 
                     player.stopUsingItem();
                     
@@ -926,6 +1436,47 @@ public class FeathersWeaponry {
                     tag.remove("ChargedProjectiles");
                 }
             }
+        }
+
+        @SubscribeEvent
+        public void onPlayerLoggedOut(net.minecraftforge.event.entity.player.PlayerEvent.PlayerLoggedOutEvent event) {
+            if (event != null && event.getEntity() != null) {
+                UUID uuid = event.getEntity().getUUID();
+                if (uuid != null) {
+                    activeDraws.remove(uuid);
+                    PlayerDataTracker.remove(uuid);
+                }
+            }
+        }
+
+        @SubscribeEvent
+        public void onPlayerRespawn(net.minecraftforge.event.entity.player.PlayerEvent.PlayerRespawnEvent event) {
+            if (event != null && event.getEntity() != null) {
+                UUID uuid = event.getEntity().getUUID();
+                if (uuid != null) {
+                    activeDraws.remove(uuid);
+                    PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(uuid);
+                    data.reset();
+                }
+            }
+        }
+
+        @SubscribeEvent
+        public void onPlayerClone(net.minecraftforge.event.entity.player.PlayerEvent.Clone event) {
+            if (event != null && event.getEntity() != null) {
+                UUID uuid = event.getEntity().getUUID();
+                if (uuid != null) {
+                    activeDraws.remove(uuid);
+                    PlayerDataTracker.PlayerData data = PlayerDataTracker.getOrCreate(uuid);
+                    data.reset();
+                }
+            }
+        }
+
+        @SubscribeEvent
+        public void onServerStopped(net.minecraftforge.event.server.ServerStoppedEvent event) {
+            activeDraws.clear();
+            PlayerDataTracker.clear();
         }
     }
 }

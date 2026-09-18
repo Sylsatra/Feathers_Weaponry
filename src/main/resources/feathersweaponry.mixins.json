@@ -1,0 +1,15 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.example.feathers_weaponry.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "client": [
+    "MinecraftInputGateMixin",
+    "BetterCombatUpswingMixin",
+    "LocalPlayerMovementGateMixin",
+    "LivingEntityMovementGateMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
